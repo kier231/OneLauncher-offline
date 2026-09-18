@@ -1,0 +1,2130 @@
+//! Core operations go onto freya's UI-thread executor radio state is `!Send`
+//!
+//! Always `spawn_forever` never `spawn` Freya's `spawn` cancels the task when
+//! the calling component unmounts this work is app-scoped not component-scoped
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use freya::prelude::spawn_forever;
+use freya::radio::RadioStation;
+use oneclient_cluster::profiles::list_named_profiles;
+use oneclient_cluster::{
+    Cluster, ClusterStage, ClusterUpdate, GameSettingsProfile, PackageUpdateMode, ProfileUpdate,
+};
+use oneclient_common::domain::{ContentType, ProviderId};
+use oneclient_content::packages::{LiveSync, LocalImportReport};
+use oneclient_core::relocate::RelocationPlan;
+use oneclient_core::settings::LauncherSettings;
+use oneclient_core::settings::store::{save_global_profile, save_settings_and_apply};
+use oneclient_db::models::ClusterId;
+use oneclient_events::{Answer, Level};
+use tokio::sync::mpsc;
+
+use crate::components::IconType;
+use crate::{invalidate_java_queries, launcher};
+use crate::notifications::{
+    ClusterUpdateSummary, NotificationAction, NotificationSpec, OptionalModRef, OptionalModsGroup,
+    PackageUpdateGroup, PendingPrompt,
+};
+use crate::state::{AppChannel, AppState, AsyncStatus, RelocationState};
+
+/// Over-disabling is the cheaper mistake a dead button beats a second game
+const LAUNCH_HOLD: Duration = Duration::from_secs(2);
+
+/// Mirrors `oneclient_net`'s reachability probe not reqwest's per-request
+/// timeouts which are minutes long This sits between Play and the game
+const UPDATE_CHECK_BUDGET: Duration = Duration::from_secs(8);
+const BUNDLE_CHECK_INTERVAL: Duration = Duration::from_secs(15 * 60);
+const BUNDLE_SYNC_BUDGET: Duration = Duration::from_secs(30);
+/// The downloads need one too the net stack alone retries for minutes and the
+/// launch button is already claimed by then
+const BUNDLE_APPLY_BUDGET: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Default)]
+struct BundleCheckLog {
+    checked_at: HashMap<ClusterId, Instant>,
+}
+
+impl BundleCheckLog {
+    fn due(&self, cluster_id: ClusterId, now: Instant) -> bool {
+        self.checked_at
+            .get(&cluster_id)
+            .is_none_or(|last| now.duration_since(*last) >= BUNDLE_CHECK_INTERVAL)
+    }
+
+    fn record(&mut self, cluster_id: ClusterId, now: Instant) {
+        self.checked_at.insert(cluster_id, now);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum LaunchUpdatePlan {
+    Nothing,
+    Apply(Vec<oneclient_core::BrowserPackageUpdate>),
+    Prompt(Vec<oneclient_core::BrowserPackageUpdate>),
+}
+
+/// Kept pure and separate from the work it describes so the three-way mode is
+/// testable without a launcher database or provider
+///
+/// `pending` has already had declined versions filtered out by
+/// `BrowserUpdateCheck::pending`
+fn plan_launch_updates(
+    mode: PackageUpdateMode,
+    pending: Vec<oneclient_core::BrowserPackageUpdate>,
+) -> LaunchUpdatePlan {
+    if pending.is_empty() {
+        return LaunchUpdatePlan::Nothing;
+    }
+
+    match mode {
+        // The cache was already written skipping only affects what is shown
+        PackageUpdateMode::Skip => LaunchUpdatePlan::Nothing,
+        PackageUpdateMode::Automatic => LaunchUpdatePlan::Apply(pending),
+        PackageUpdateMode::Prompt => LaunchUpdatePlan::Prompt(pending),
+    }
+}
+
+/// Names the clusters that pinned `java_path` to this runtime by hand
+fn clusters_pinned_to_java(
+    profiles: &[GameSettingsProfile],
+    clusters: &[Cluster],
+    absolute_path: &str,
+) -> Vec<String> {
+    profiles
+        .iter()
+        .filter(|profile| profile.java_path.as_deref() == Some(absolute_path))
+        .map(|profile| {
+            clusters
+                .iter()
+                .find(|cluster| {
+                    cluster.setting_profile_name.as_deref() == Some(profile.name.as_str())
+                })
+                .map_or_else(|| profile.name.clone(), |cluster| cluster.name.clone())
+        })
+        .collect()
+}
+
+/// The pump alone owns the toast timers so adding or removing a toast has to
+/// tell it to re-arm hover-pause is a timer property not component state
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PumpSignal {
+    Reconcile,
+    PauseToasts,
+    ResumeToasts,
+}
+
+#[derive(Clone)]
+pub struct Actions {
+    station: RadioStation<AppState, AppChannel>,
+    pump: mpsc::UnboundedSender<PumpSignal>,
+    events: oneclient_events::EventBus,
+    bundle_checks: Arc<Mutex<BundleCheckLog>>,
+}
+
+impl Actions {
+    #[must_use]
+    pub fn station(&self) -> RadioStation<AppState, AppChannel> {
+        self.station
+    }
+
+    /// A channel handle, so a clone still feeds the pump set up at launch
+    #[must_use]
+    pub fn events(&self) -> oneclient_events::EventBus {
+        self.events.clone()
+    }
+
+    #[must_use]
+    pub fn new(
+        station: RadioStation<AppState, AppChannel>,
+        pump: mpsc::UnboundedSender<PumpSignal>,
+        events: oneclient_events::EventBus,
+    ) -> Self {
+        Self {
+            station,
+            pump,
+            events,
+            bundle_checks: Arc::new(Mutex::new(BundleCheckLog::default())),
+        }
+    }
+
+    fn nudge(&self, signal: PumpSignal) {
+        let _ = self.pump.send(signal);
+    }
+
+    fn bundle_check_due(&self, cluster_id: ClusterId) -> bool {
+        self.bundle_checks
+            .lock()
+            .unwrap()
+            .due(cluster_id, Instant::now())
+    }
+
+    fn record_bundle_checks(&self, cluster_ids: impl IntoIterator<Item = ClusterId>) {
+        let now = Instant::now();
+        let mut log = self.bundle_checks.lock().unwrap();
+        for cluster_id in cluster_ids {
+            log.record(cluster_id, now);
+        }
+    }
+
+    fn with_engine(&self, mutate: impl FnOnce(&mut AppState)) {
+        {
+            let mut guard = self.station.clone().write_channel(AppChannel::Notifications);
+            mutate(&mut guard);
+        }
+        self.nudge(PumpSignal::Reconcile);
+    }
+
+    fn set_settings_error(&self, error: Option<String>) {
+        self.station
+            .clone()
+            .write_channel(AppChannel::Settings)
+            .settings
+            .error = error;
+    }
+
+    pub fn reload_settings(&self) {
+        let station = self.station;
+        spawn_forever(async move {
+            let Ok(state) = launcher::state() else { return };
+            {
+                let mut guard = station.clone().write_channel(AppChannel::Settings);
+                guard.settings.status = AsyncStatus::Loading;
+                guard.settings.error = None;
+            }
+
+            let loaded = oneclient_core::settings::store::load_settings(Some(
+                &state.services.events,
+            ))
+            .await;
+            let discord_enabled = loaded.discord_enabled;
+            *state.settings.write() = loaded.clone();
+            state.discord.set_enabled(discord_enabled);
+
+            let mut guard = station.clone().write_channel(AppChannel::Settings);
+            guard.settings.settings = loaded;
+            guard.settings.status = AsyncStatus::Ready;
+            guard.settings.error = None;
+        });
+    }
+
+    pub fn save_settings(&self) {
+        let actions = self.clone();
+        spawn_forever(async move {
+            let Ok(state) = launcher::state() else { return };
+            {
+                let mut guard = actions.station.clone().write_channel(AppChannel::Settings);
+                guard.settings.saving = true;
+                guard.settings.error = None;
+            }
+
+            let settings = state.settings.read().clone();
+            let result = save_settings_and_apply(&state.services, &settings).await;
+
+            let mut guard = actions.station.clone().write_channel(AppChannel::Settings);
+            guard.settings.error = result.err().map(|err| err.to_string());
+            guard.settings.saving = false;
+            guard.settings.status = AsyncStatus::Ready;
+        });
+    }
+
+    fn mutate_settings(&self, mutate: impl FnOnce(&mut LauncherSettings)) -> Option<LauncherSettings> {
+        let state = launcher::state().ok()?;
+        let updated = {
+            let mut lock = state.settings.write();
+            mutate(&mut lock);
+            lock.clone()
+        };
+
+        let mut guard = self.station.clone().write_channel(AppChannel::Settings);
+        guard.settings.settings = updated.clone();
+        guard.settings.status = AsyncStatus::Ready;
+        Some(updated)
+    }
+
+    fn persist(&self, settings: LauncherSettings) {
+        let actions = self.clone();
+        spawn_forever(async move {
+            let Ok(state) = launcher::state() else { return };
+            if let Err(err) = save_settings_and_apply(&state.services, &settings).await {
+                actions.set_settings_error(Some(err.to_string()));
+            }
+        });
+    }
+
+    pub fn set_settings(&self, settings: LauncherSettings) {
+        let Some(updated) = self.mutate_settings(|s| *s = settings) else {
+            return;
+        };
+        if let Ok(state) = launcher::state() {
+            state.discord.set_enabled(updated.discord_enabled);
+        }
+        self.persist(updated);
+    }
+
+    /// Not persisted the next real save carries the seen versions along
+    pub fn record_seen_version(&self, version: impl Into<String>) {
+        let version = version.into();
+        self.mutate_settings(|settings| {
+            if !settings.seen_versions.iter().any(|v| v == &version) {
+                settings.seen_versions.push(version);
+            }
+        });
+    }
+
+    pub fn set_seen_changelog_version(&self, version: impl Into<String>) {
+        let version = version.into();
+        let mut changed = false;
+        let updated = self.mutate_settings(|settings| {
+            if settings.seen_changelog_version.as_deref() != Some(version.as_str()) {
+                settings.seen_changelog_version = Some(version);
+                changed = true;
+            }
+        });
+
+        if let (true, Some(updated)) = (changed, updated) {
+            self.persist(updated);
+        }
+    }
+
+    pub fn mark_onboarding_seen(&self) {
+        if let Some(updated) = self.mutate_settings(|settings| settings.seen_onboarding = true) {
+            self.persist(updated);
+        }
+    }
+
+    pub fn skip_microsoft_java(&self) {
+        if let Some(updated) = self.mutate_settings(|settings| settings.skip_microsoft_java = true)
+        {
+            self.persist(updated);
+        }
+    }
+  
+    pub fn reset_onboarding(&self) {
+        if let Some(updated) = self.mutate_settings(|settings| {
+            settings.seen_onboarding = false;
+            settings.accepted_tos_version = 0;
+            settings.accepted_privacy_version = 0;
+            settings.seen_versions.clear();
+        }) {
+            self.persist(updated);
+        }
+    }
+
+    pub fn accept_tos(&self, terms_version: u32, privacy_version: u32) {
+        let mut was_declined = false;
+
+        let Some(updated) = self.mutate_settings(|settings| {
+            was_declined = settings.declined_tos;
+            settings.accepted_tos_version = terms_version;
+            settings.accepted_privacy_version = privacy_version;
+            settings.declined_tos = false;
+        }) else {
+            return;
+        };
+
+        self.persist(updated);
+
+        if was_declined {
+            self.notify("Restart to finish")
+                .body(
+                    "Thanks. OneClient reconnects to Polyfrost services the next time you start \
+                     it.",
+                )
+                .icon(IconType::RefreshCw01)
+                .send();
+        }
+    }
+
+    pub fn decline_tos(&self) {
+        oneclient_common::consent::decline();
+
+        if let Some(updated) = self.mutate_settings(|settings| {
+            settings.declined_tos = true;
+            settings.accepted_tos_version = 0;
+            settings.accepted_privacy_version = 0;
+        }) {
+            self.persist(updated);
+        }
+    }
+
+    pub fn save_global_profile(&self, profile: GameSettingsProfile) {
+        let actions = self.clone();
+        spawn_forever(async move {
+            let Ok(state) = launcher::state() else { return };
+            if let Err(err) = save_global_profile(&state.settings, profile).await {
+                tracing::error!("failed to save the global profile: {err:#}");
+                return;
+            }
+            actions.mutate_settings(|_| {});
+            super::invalidate_profile_queries().await;
+        });
+    }
+
+    pub fn update_global_profile(&self, update: ProfileUpdate) {
+        let actions = self.clone();
+        spawn_forever(async move {
+            let Ok(state) = launcher::state() else { return };
+            let mut global = state.settings.read().global_game_settings.clone();
+            update.apply(&mut global);
+            if let Err(err) = save_global_profile(&state.settings, global).await {
+                tracing::error!("failed to update the global profile: {err:#}");
+                return;
+            }
+            actions.mutate_settings(|_| {});
+            super::invalidate_profile_queries().await;
+        });
+    }
+
+    pub fn create_settings_profile(&self, name: impl Into<String>) {
+        let name = name.into();
+        spawn_forever(async move {
+            let Ok(state) = launcher::state() else { return };
+            let global = state.settings.read().global_game_settings.clone();
+            match oneclient_cluster::profiles::create_settings_profile(
+                &state.services.db,
+                &global,
+                &name,
+            )
+            .await
+            {
+                Ok(_) => super::invalidate_profile_queries().await,
+                Err(err) => tracing::error!("failed to create settings profile: {err:#}"),
+            }
+        });
+    }
+
+    pub fn create_profile_from_global(
+        &self,
+        name: impl Into<String>,
+        mem_max: Option<u32>,
+        force_fullscreen: Option<bool>,
+    ) {
+        let name = name.into();
+        spawn_forever(async move {
+            let Ok(state) = launcher::state() else { return };
+            let global = state.settings.read().global_game_settings.clone();
+            match oneclient_cluster::profiles::create_profile_from_global(
+                &state.services.db,
+                &global,
+                &name,
+                mem_max,
+                force_fullscreen,
+            )
+            .await
+            {
+                Ok(_) => super::invalidate_profile_queries().await,
+                Err(err) => tracing::error!("failed to create profile: {err:#}"),
+            }
+        });
+    }
+
+    pub fn upsert_named_profile(&self, profile: GameSettingsProfile) {
+        spawn_forever(async move {
+            let Ok(state) = launcher::state() else { return };
+            match oneclient_cluster::profiles::upsert_named_profile(&state.services.db, &profile)
+                .await
+            {
+                Ok(_) => super::invalidate_profile_queries().await,
+                Err(err) => tracing::error!("failed to save profile: {err:#}"),
+            }
+        });
+    }
+
+    pub fn update_named_profile(&self, name: impl Into<String>, update: ProfileUpdate) {
+        let name = name.into();
+        spawn_forever(async move {
+            let Ok(state) = launcher::state() else { return };
+            match oneclient_cluster::profiles::update_named_profile(
+                &state.services.db,
+                &name,
+                update,
+            )
+            .await
+            {
+                Ok(_) => super::invalidate_profile_queries().await,
+                Err(err) => tracing::error!("failed to update profile: {err:#}"),
+            }
+        });
+    }
+
+    pub fn delete_named_profile(&self, name: impl Into<String>) {
+        let name = name.into();
+        spawn_forever(async move {
+            let Ok(state) = launcher::state() else { return };
+            match oneclient_cluster::profiles::delete_named_profile(&state.services.db, &name).await
+            {
+                Ok(()) => super::invalidate_profile_queries().await,
+                Err(err) => tracing::error!("failed to delete profile: {err:#}"),
+            }
+        });
+    }
+
+    pub fn update_cluster_profile(&self, cluster_id: ClusterId, update: ProfileUpdate) {
+        spawn_forever(async move {
+            let Ok(state) = launcher::state() else { return };
+            match state.clusters.update_profile(cluster_id, update).await {
+                Ok(_) => super::invalidate_profile_queries().await,
+                Err(err) => tracing::error!("failed to update cluster profile: {err:#}"),
+            }
+        });
+    }
+
+    pub fn create_and_assign_cluster_profile(
+        &self,
+        cluster_id: ClusterId,
+        profile_name: impl Into<String>,
+    ) {
+        let profile_name = profile_name.into();
+        spawn_forever(async move {
+            let Ok(state) = launcher::state() else { return };
+            let global = state.settings.read().global_game_settings.clone();
+            match state
+                .clusters
+                .create_and_assign_profile(&global, cluster_id, &profile_name)
+                .await
+            {
+                Ok(_) => super::invalidate_profile_queries().await,
+                Err(err) => tracing::error!("failed to assign cluster profile: {err:#}"),
+            }
+        });
+    }
+
+    pub fn set_cluster_loader_version(&self, cluster_id: ClusterId, version: impl Into<String>) {
+        let version = version.into();
+        spawn_forever(async move {
+            let Ok(state) = launcher::state() else { return };
+            if let Err(err) = state
+                .clusters
+                .update(cluster_id, ClusterUpdate::default().loader_version(version))
+                .await
+            {
+                tracing::error!("failed to set loader version: {err:#}");
+                return;
+            }
+            // Best effort on failure the cluster just will not re-download
+            let _ = state
+                .clusters
+                .set_stage(cluster_id, ClusterStage::NotReady)
+                .await;
+            super::invalidate_cluster_queries().await;
+        });
+    }
+
+    pub fn import_launcher(
+        &self,
+        source: oneclient_core::MigrationSource,
+        folder_name: impl Into<String>,
+        target: oneclient_core::ImportTarget,
+    ) {
+        let folder_name = folder_name.into();
+        spawn_forever(async move {
+            let Ok(state) = launcher::state() else { return };
+            let events = state.services.events.clone();
+            match oneclient_core::import_migration_game_dir(&state, source, &folder_name, target)
+                .await
+            {
+                Ok(()) => {
+                    events
+                        .notify("Import complete")
+                        .body(format!("Copied your files from {}.", source.display_name()))
+                        .send();
+                    events.signal(oneclient_events::Signal::ClustersChanged);
+                }
+                Err(err) => events
+                    .notify("Import failed")
+                    .body(err.to_string())
+                    .error()
+                    .send(),
+            }
+        });
+    }
+
+    pub fn install_java_runtime(&self, vendor: oneclient_java::JavaVendor, major: u32) {
+        spawn_forever(async move {
+            let Ok(state) = launcher::state() else { return };
+            let events = state.services.events.clone();
+            match state.java.install_runtime_from(&vendor, major).await {
+                Ok(_) => {
+                    events.signal(oneclient_events::Signal::JavaChanged);
+                    invalidate_java_queries().await
+                },
+                Err(err) => {
+					events
+                    .notify("Java install failed")
+                    .body(err.to_string())
+                    .error()
+                    .send()
+				}
+            }
+        });
+    }
+
+    pub fn add_custom_java_runtime(&self, path: PathBuf) {
+        spawn_forever(async move {
+            let Ok(state) = launcher::state() else { return };
+            let events = state.services.events.clone();
+            match state.java.add_custom_runtime(path).await {
+                Ok(runtime) => {
+                    events
+                        .notify("Java added")
+                        .body(format!("Java {} ({})", runtime.major, runtime.vendor))
+                        .send();
+                    events.signal(oneclient_events::Signal::JavaChanged);
+                }
+                Err(err) => events
+                    .notify("Failed to add Java")
+                    .body(err.to_string())
+                    .error()
+                    .send(),
+            }
+        });
+    }
+
+    pub fn remove_java_runtime(&self, path: impl Into<String>) {
+        let path = path.into();
+        spawn_forever(async move {
+            let Ok(state) = launcher::state() else { return };
+            let events = state.services.events.clone();
+
+            // Checks if the jdk is pinned to the cluster
+            match (
+                list_named_profiles(&state.services.db).await,
+                state.clusters.list().await,
+            ) {
+                (Ok(profiles), Ok(clusters)) => {
+                    let pinned = clusters_pinned_to_java(&profiles, &clusters, &path);
+                    if !pinned.is_empty() {
+                        events
+                            .notify("Cannot remove this JDK")
+                            .body(format!("It is used by cluster: {}", pinned.join(", ")))
+                            .error()
+                            .send();
+                        return;
+                    }
+                }
+                (Err(err), _) | (_, Err(err)) => {
+                    tracing::error!("could not check whether the java runtime is in use: {err:#}");
+                }
+            }
+
+            match state.java.remove_runtime(&path).await {
+                Ok(()) => super::invalidate_java_queries().await,
+                Err(err) => tracing::error!("failed to remove java runtime: {err:#}"),
+            }
+        });
+    }
+
+    pub fn toggle_notification_center(&self) {
+        self.with_engine(|state| {
+            state.center_open = state
+                .notifications
+                .toggle_center(&mut state.inbox, state.center_open);
+        });
+    }
+
+    pub fn toggle_account_switcher(&self) {
+        let open = self.station.peek().account_switcher_open;
+        self.station
+            .clone()
+            .write_channel(AppChannel::AccountSwitcher)
+            .account_switcher_open = !open;
+    }
+
+    pub fn close_account_switcher(&self) {
+        self.station
+            .clone()
+            .write_channel(AppChannel::AccountSwitcher)
+            .account_switcher_open = false;
+    }
+
+    pub fn close_notification_center(&self) {
+        self.with_engine(|state| state.center_open = false);
+    }
+
+    pub fn clear_notification_inbox(&self) {
+        self.with_engine(|state| {
+            state.inbox.clear();
+            state.notifications.clear_inbox();
+        });
+    }
+
+    pub fn dismiss_toast(&self, entry_id: u64) {
+        self.with_engine(|state| state.notifications.dismiss_toast(&mut state.inbox, entry_id));
+    }
+
+    pub fn mark_notification_read(&self, entry_id: u64) {
+        self.with_engine(|state| state.notifications.mark_read(&mut state.inbox, entry_id));
+    }
+
+    pub fn dismiss_notification(&self, entry_id: u64) {
+        self.with_engine(|state| {
+            state
+                .notifications
+                .dismiss_notification(&mut state.inbox, entry_id);
+        });
+    }
+
+    pub fn open_cluster_update(&self, summaries: Vec<ClusterUpdateSummary>) {
+        self.with_engine(|state| {
+            state.notifications.open_cluster_update(summaries);
+            state.center_open = false;
+        });
+    }
+
+    pub fn close_cluster_update(&self) {
+        self.with_engine(|state| state.notifications.close_cluster_update());
+    }
+
+    pub fn open_optional_mods(
+        &self,
+        groups: Vec<OptionalModsGroup>,
+        done: Option<tokio::sync::oneshot::Sender<()>>,
+    ) {
+        self.with_engine(move |state| state.notifications.open_optional_mods(groups, done));
+    }
+
+    pub fn close_optional_mods(&self) {
+        self.with_engine(|state| state.notifications.finish_optional_mods());
+    }
+
+    pub fn decline_optional_mods(&self, mods: Vec<(ClusterId, OptionalModRef)>) {
+        self.close_optional_mods();
+        self.record_skipped_optional_mods(mods);
+    }
+
+    pub fn record_skipped_optional_mods(&self, mods: Vec<(ClusterId, OptionalModRef)>) {
+        if mods.is_empty() {
+            return;
+        }
+
+        spawn_forever(async move {
+            let Ok(state) = launcher::state() else { return };
+            let content = state.services.content();
+
+            for (cluster_id, package_ids) in group_by_cluster(&mods) {
+                if let Err(err) =
+                    oneclient_core::skip_optional_mods(cluster_id, &package_ids, &content).await
+                {
+                    tracing::warn!(
+                        cluster_id,
+                        error = %err,
+                        "failed to record skipped optional mods, they will come back as new"
+                    );
+                }
+            }
+        });
+    }
+
+    /// Holds the launch until the mods are actually on disk Minecraft reads
+    /// `mods/` once at startup, so finishing after the process starts is useless
+    pub fn enable_optional_mods(&self, mods: Vec<(ClusterId, OptionalModRef)>) {
+        if mods.is_empty() {
+            self.close_optional_mods();
+            return;
+        }
+
+        // Off screen straight away, but the launch keeps waiting until the
+        // install below is done, so the pause needs a progress notification of
+        // its own the same way `apply_updates_for_launch` gives one
+        self.with_engine(|state| state.notifications.hide_optional_mods());
+        let actions = self.clone();
+
+        spawn_forever(async move {
+            let Ok(state) = launcher::state() else {
+                actions.close_optional_mods();
+                return;
+            };
+            let content = state.services.content();
+            let events = state.services.events.clone();
+            let session = oneclient_events::GroupedProgressSession::start(
+                &events,
+                "Adding optional mods",
+            );
+            let opt_in = session.child(
+                "Enabling mods",
+                mods.len() as u64,
+                oneclient_events::TaskCategory::Packages,
+            );
+            opt_in.set_phase(oneclient_events::TaskPhase::Installing);
+
+            let mut clusters: Vec<ClusterId> = Vec::new();
+            let mut enabled: Vec<(ClusterId, OptionalModRef)> = Vec::new();
+            let mut failed = 0usize;
+            for (cluster_id, (bundle_name, package_id)) in &mods {
+                match oneclient_core::set_bundle_package_enabled(
+                    *cluster_id,
+                    bundle_name,
+                    package_id,
+                    true,
+                    false,
+                    &content,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        if !clusters.contains(cluster_id) {
+                            clusters.push(*cluster_id);
+                        }
+                        enabled.push((*cluster_id, (bundle_name.clone(), package_id.clone())));
+                    }
+                    Err(err) => {
+                        failed += 1;
+                        tracing::warn!(
+                            cluster_id,
+                            %bundle_name,
+                            %package_id,
+                            error = %err,
+                            "failed to opt in to an optional mod"
+                        );
+                    }
+                }
+            }
+
+            opt_in.finish();
+
+            let mut installed = 0usize;
+            let mut applied: Vec<ClusterId> = Vec::new();
+            for cluster_id in &clusters {
+                match oneclient_core::apply_bundle_updates_with(
+                    *cluster_id,
+                    state.bundles.as_ref(),
+                    &content,
+                    Some(&session),
+                )
+                .await
+                {
+                    Ok(result) => {
+                        installed += result.additions_applied.len();
+                        failed += result.additions_failed.len();
+                        applied.push(*cluster_id);
+                    }
+                    Err(err) => {
+                        tracing::warn!(cluster_id, error = %err, "failed to install optional mods");
+                    }
+                }
+            }
+
+            // An offer only counts as answered once its mod really was enabled
+            // and installed otherwise the click is lost and never comes back
+            enabled.retain(|(cluster_id, _)| applied.contains(cluster_id));
+            for (cluster_id, package_ids) in group_by_cluster(&enabled) {
+                if let Err(err) =
+                    oneclient_core::resolve_optional_mods(cluster_id, &package_ids, &content).await
+                {
+                    tracing::warn!(cluster_id, error = %err, "failed to clear answered offers");
+                }
+            }
+
+            session.finish();
+            super::invalidate_cluster_queries().await;
+
+            if installed > 0 {
+                events
+                    .notify("Mods added")
+                    .body(format!(
+                        "{installed} mod{} added",
+                        if installed == 1 { "" } else { "s" }
+                    ))
+                    .send();
+            }
+            if failed > 0 {
+                events
+                    .notify("Some mods were not added")
+                    .body(format!(
+                        "{failed} mod{} could not be installed",
+                        if failed == 1 { "" } else { "s" }
+                    ))
+                    .error()
+                    .send();
+            }
+
+            actions.close_optional_mods();
+        });
+    }
+
+    pub fn close_package_updates(&self) {
+        self.with_engine(|state| state.notifications.close_package_updates());
+    }
+
+    /// Hovering any toast pauses every toast including ones arriving while
+    /// hovering hence a pump signal rather than a state flag
+    pub fn pause_toasts(&self) {
+        self.nudge(PumpSignal::PauseToasts);
+    }
+
+    pub fn resume_toasts(&self) {
+        self.nudge(PumpSignal::ResumeToasts);
+    }
+
+    pub fn answer_prompt(&self, answer: Answer) {
+        self.reply_to_prompt(Some(answer));
+    }
+
+    pub fn dismiss_prompt(&self) {
+        self.reply_to_prompt(None);
+    }
+
+    fn reply_to_prompt(&self, answer: Option<Answer>) {
+        let taken = self
+            .station
+            .clone()
+            .write_channel(AppChannel::Notifications)
+            .prompt
+            .take();
+
+        if let Some(PendingPrompt {
+            reply_tx: Some(reply_tx),
+            ..
+        }) = taken
+        {
+            let _ = reply_tx.send(answer);
+        }
+    }
+
+    pub fn notify(&self, title: impl Into<String>) -> NotificationBuilder {
+        NotificationBuilder {
+            actions: self.clone(),
+            spec: NotificationSpec {
+                title: title.into(),
+                body: String::new(),
+                level: Level::Info,
+                icon: None,
+                progress: None,
+                actions: Vec::new(),
+            },
+        }
+    }
+
+    fn push_notification(&self, spec: NotificationSpec) {
+        self.with_engine(|state| {
+            state.notifications.push_custom(&mut state.inbox, spec);
+        });
+    }
+
+    pub fn send_test_progress(&self, current: u64, total: u64) {
+        let Ok(state) = launcher::state() else { return };
+        let id = uuid::Uuid::from_u128(0x0CE0_0CE0_0CE0_0CE0_0CE0_0CE0_0CE0_0CE0);
+        state
+            .services
+            .events
+            .progress(id, "Downloading assets", current, total);
+    }
+
+    pub fn launch_cluster(&self, cluster_id: ClusterId) {
+        let claimed = self
+            .station
+            .clone()
+            .write_channel(AppChannel::Game)
+            .game
+            .begin_launch(cluster_id);
+        if !claimed {
+            return;
+        }
+
+        let station = self.station;
+        let actions = self.clone();
+        spawn_forever(async move {
+            let started = Instant::now();
+            launch(&actions, cluster_id).await;
+
+            // An instant failure would hand the button back inside the same
+            // click burst so hold it for the floor either way
+            if let Some(remaining) = LAUNCH_HOLD.checked_sub(started.elapsed()) {
+                tokio::time::sleep(remaining).await;
+            }
+            station
+                .clone()
+                .write_channel(AppChannel::Game)
+                .game
+                .finish_launch(cluster_id);
+        });
+    }
+
+    pub fn kill_cluster(&self, cluster_id: ClusterId) {
+        let Ok(state) = launcher::state() else { return };
+        if !state.games.kill(cluster_id) {
+            tracing::debug!(cluster_id, "kill requested but no tracked process");
+        }
+    }
+
+    pub fn dismiss_game_error(&self) {
+        self.station
+            .clone()
+            .write_channel(AppChannel::Game)
+            .game
+            .error = None;
+    }
+
+    pub fn import_local_file(&self, cluster_id: ClusterId, content_type: ContentType, path: PathBuf) {
+        self.import_local_files(cluster_id, vec![(path, content_type)]);
+    }
+
+    pub fn import_local_files(
+        &self,
+        cluster_id: ClusterId,
+        files: Vec<(PathBuf, ContentType)>,
+    ) {
+        if files.is_empty() {
+            return;
+        }
+
+        spawn_forever(async move {
+            let Ok(state) = launcher::state() else { return };
+            let events = state.services.events.clone();
+            match oneclient_content::packages::PackageStore::import_local_files(
+                &files,
+                cluster_id,
+                &state.services.content(),
+            )
+            .await
+            {
+                Ok(report) => {
+                    let mut deferred = false;
+                    for row in &report.imported {
+                        let live = oneclient_content::packages::PackageStore::sync_live_content(
+                            cluster_id,
+                            row,
+                            &state.services.content(),
+                        )
+                        .await
+                        .unwrap_or(LiveSync::Skipped);
+
+                        deferred |= live == LiveSync::Deferred;
+                    }
+
+                    notify_import(&events, &report, deferred && state.games.is_active(cluster_id));
+                    super::invalidate_cluster_queries().await;
+                }
+                Err(err) => events
+                    .notify("Import failed")
+                    .body(err.to_string())
+                    .error()
+                    .send(),
+            }
+        });
+    }
+
+    pub fn install_package(
+        &self,
+        cluster_id: ClusterId,
+        provider: ProviderId,
+        project_id: impl Into<String>,
+        version_id: impl Into<String>,
+    ) {
+        let (project_id, version_id) = (project_id.into(), version_id.into());
+        let actions = self.clone();
+
+        self.station
+            .clone()
+            .write_channel(AppChannel::Installs)
+            .installs
+            .begin(cluster_id, provider, project_id.clone());
+
+        spawn_forever(async move {
+            let finish = |actions: &Actions| {
+                actions
+                    .station
+                    .clone()
+                    .write_channel(AppChannel::Installs)
+                    .installs
+                    .finish(cluster_id, provider, &project_id);
+            };
+
+            let Ok(state) = launcher::state() else {
+                finish(&actions);
+                return;
+            };
+
+            let install = crate::install::install_package(
+                &state,
+                provider,
+                &project_id,
+                &version_id,
+                cluster_id,
+            )
+            .await;
+
+            // Replaces the download's progress notification in place rather
+            // than arriving as a second one
+            let spec = match &install.result {
+                Ok(name) => NotificationSpec {
+                    title: "Installed".to_string(),
+                    body: crate::install::install_body(
+                        name,
+                        &install.dependencies,
+                        &install.missing_dependencies,
+                        install.live_deferred,
+                    ),
+                    level: Level::Info,
+                    icon: Some(IconType::Download01),
+                    progress: None,
+                    actions: Vec::new(),
+                },
+                Err(err) => NotificationSpec {
+                    title: "Install failed".to_string(),
+                    body: err.to_string(),
+                    level: Level::Error,
+                    icon: None,
+                    progress: None,
+                    actions: Vec::new(),
+                },
+            };
+
+            let session_id = install.session_id.unwrap_or_else(uuid::Uuid::nil);
+            actions.with_engine(|app| {
+                app.notifications
+                    .finish_grouped_as_actions(&mut app.inbox, session_id, Some(spec));
+            });
+
+            if install.result.is_ok() {
+                // Before the refresh below so the version list never renders
+                // the moment where both copies read as active
+                if let Err(err) = oneclient_content::bundles::reconcile_duplicate_activity(
+                    cluster_id,
+                    &state.services.content(),
+                )
+                .await
+                {
+                    tracing::warn!(%err, "failed to resolve duplicate package versions");
+                }
+
+                super::invalidate_cluster_content_queries().await;
+
+                state
+                    .services
+                    .events
+                    .signal(oneclient_events::Signal::ClustersChanged);
+            }
+
+            finish(&actions);
+        });
+    }
+
+    /// Shares the installs channel with [`Self::install_package`] so every row's
+    /// button reads as busy while one is being acted on
+    ///
+    /// Recorded as a bundle override when a bundle owns the artifact otherwise
+    /// the next sync puts the version straight back
+    pub fn remove_package_version(
+        &self,
+        cluster_id: ClusterId,
+        provider: ProviderId,
+        project_id: impl Into<String>,
+        hash: impl Into<String>,
+        display_name: impl Into<String>,
+    ) {
+        let (project_id, hash, display_name) =
+            (project_id.into(), hash.into(), display_name.into());
+        let actions = self.clone();
+
+        self.station
+            .clone()
+            .write_channel(AppChannel::Installs)
+            .installs
+            .begin(cluster_id, provider, project_id.clone());
+
+        spawn_forever(async move {
+            let finish = |actions: &Actions| {
+                actions
+                    .station
+                    .clone()
+                    .write_channel(AppChannel::Installs)
+                    .installs
+                    .finish(cluster_id, provider, &project_id);
+            };
+
+            let Ok(state) = launcher::state() else {
+                finish(&actions);
+                return;
+            };
+
+            let events = state.services.events.clone();
+            match oneclient_core::remove_artifact_from_cluster(
+                cluster_id,
+                &hash,
+                true,
+                &state.services.content(),
+            )
+            .await
+            {
+                Ok(()) => {
+                    events.notify("Removed").body(display_name).send();
+
+                    // The row's next state is read off the cluster's content
+                    // so refresh that before the busy flag drops
+                    super::invalidate_cluster_content_queries().await;
+                    events.signal(oneclient_events::Signal::ClustersChanged);
+                }
+                Err(err) => events
+                    .notify("Remove failed")
+                    .body(err.to_string())
+                    .error()
+                    .send(),
+            }
+
+            finish(&actions);
+        });
+    }
+
+    pub fn install_bundle(
+        &self,
+        cluster_id: ClusterId,
+        bundle_name: impl Into<String>,
+        skip_compatibility: bool,
+    ) {
+        let bundle_name = bundle_name.into();
+        spawn_forever(async move {
+            let Ok(state) = launcher::state() else { return };
+            let events = state.services.events.clone();
+            match oneclient_core::install_bundle(
+                cluster_id,
+                &bundle_name,
+                skip_compatibility,
+                state.bundles.as_ref(),
+                &state.services.content(),
+            )
+            .await
+            {
+                Ok(_) => {
+                    events
+                        .notify("Installed")
+                        .body(format!("Added {bundle_name}"))
+                        .send();
+                    events.signal(oneclient_events::Signal::ClustersChanged);
+                }
+                Err(err) => events
+                    .notify("Install failed")
+                    .body(err.to_string())
+                    .error()
+                    .send(),
+            }
+        });
+    }
+
+    pub fn apply_bundle_updates(&self, cluster_id: ClusterId) {
+        let actions = self.clone();
+        spawn_forever(async move {
+            let Ok(state) = launcher::state() else { return };
+            let result = match oneclient_core::apply_bundle_updates(
+                cluster_id,
+                state.bundles.as_ref(),
+                &state.services.content(),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(err) => {
+                    state
+                        .services
+                        .events
+                        .notify("Update failed")
+                        .body(err.to_string())
+                        .error()
+                        .send();
+                    return;
+                }
+            };
+
+            actions.record_bundle_checks([cluster_id]);
+
+            super::invalidate_cluster_queries().await;
+            if let Some(spec) =
+                crate::install::cluster_update_notification(cluster_id, &result, &state.services)
+                    .await
+            {
+                // The offers are queued by the sync itself and raised at launch
+                // this path only reports what changed
+                actions.push_notification(spec);
+            }
+        });
+    }
+
+    /// App-scoped on purpose: the copy has to outlive the settings page, which
+    /// unmounts as soon as the router swaps to the move screen
+    pub fn relocate(&self, plan: RelocationPlan) {
+        let state = match launcher::state() {
+            Ok(state) => state,
+            Err(err) => {
+                tracing::error!("move skipped, launcher not ready: {err:#}");
+                self.write_relocation(RelocationState {
+                    plan: Some(plan),
+                    result: Some(Err(format!("OneClient is not ready yet: {err}"))),
+                    ..RelocationState::default()
+                });
+                return;
+            }
+        };
+
+        self.write_relocation(RelocationState {
+            plan: Some(plan.clone()),
+            ..RelocationState::default()
+        });
+
+        let mut station = self.station;
+        spawn_forever(async move {
+            // The copy is on this thread's executor, so it can write the count
+            // straight into the channel the move screen reads
+            let result = oneclient_core::relocate::relocate(&state, &plan, |copied, total| {
+                let mut guard = station.write_channel(AppChannel::Relocation);
+                guard.relocation.copied = copied;
+                guard.relocation.total = total;
+            })
+            .await;
+
+            if let Err(message) = &result {
+                tracing::error!("moving the data folder failed: {message}");
+            }
+
+            let moved = result.is_ok();
+            station
+                .write_channel(AppChannel::Relocation)
+                .relocation
+                .result = Some(result);
+
+            if moved {
+                super::invalidate_leftovers_queries().await;
+            }
+        });
+    }
+
+    /// Leaves the move screen, which only the user can do and only once the
+    /// copy has settled
+    pub fn end_relocation(&self) {
+        self.write_relocation(RelocationState::default());
+    }
+
+    fn write_relocation(&self, relocation: RelocationState) {
+        self.station
+            .clone()
+            .write_channel(AppChannel::Relocation)
+            .relocation = relocation;
+    }
+
+	/// `syncing_bundles` gates every launch button so the readiness check must
+    /// happen before the flag is raised not inside the task
+    pub fn sync_bundles(&self) {
+        let state = match launcher::state() {
+            Ok(state) => state,
+            Err(err) => {
+                tracing::error!("bundle sync skipped, launcher not ready: {err:#}");
+                return;
+            }
+        };
+
+        let actions = self.clone();
+        self.station
+            .clone()
+            .write_channel(AppChannel::Launcher)
+            .launcher
+            .syncing_bundles = true;
+
+        spawn_forever(async move {
+
+            let synced = match state.bundles.sync(&state.services.content()).await {
+                Ok(_) => true,
+                Err(err) => {
+                    tracing::error!("bundle catalog sync failed: {err:#}");
+                    false
+                }
+            };
+            if let Err(err) = oneclient_core::clusters::apply_remote_migrations(&state).await {
+                tracing::error!("cluster migrations failed: {err:#}");
+            }
+            if let Err(err) = oneclient_core::clusters::ensure_from_bundles(&state).await {
+                tracing::error!("bundle cluster provisioning failed: {err:#}");
+            }
+
+            // One grouped session for the batch so all downloads surface as a
+            // single notification `detach` lets it be converted in place
+            let session = oneclient_events::GroupedProgressSession::start(
+                &state.services.events,
+                "Updating mods",
+            );
+            let changed = oneclient_content::bundles::sync_all_cluster_bundles(
+                state.bundles.as_ref(),
+                &state.services.content(),
+                Some(&session),
+            )
+            .await;
+            let session_id = session.detach();
+
+            if synced
+                && let Ok(clusters) = state.clusters.list().await
+            {
+                actions.record_bundle_checks(clusters.iter().map(|cluster| cluster.id));
+            }
+
+            actions
+                .station
+                .clone()
+                .write_channel(AppChannel::Launcher)
+                .launcher
+                .syncing_bundles = false;
+            super::invalidate_cluster_queries().await;
+
+            let spec = crate::install::combined_cluster_update_spec(&changed, &state.services).await;
+            actions.with_engine(|app| {
+                app.notifications
+                    .finish_grouped_as_actions(&mut app.inbox, session_id, spec);
+            });
+        });
+    }
+
+    async fn resolve_bundle_updates_before_launch(
+        &self,
+        state: &Arc<oneclient_core::LauncherState>,
+        cluster_id: ClusterId,
+    ) {
+        if !self.bundle_check_due(cluster_id) {
+            tracing::debug!(cluster_id, "bundle update check skipped, checked recently");
+            return;
+        }
+
+        let content = state.services.content();
+
+        if let Ok(false) = oneclient_core::cluster_has_bundle_content(cluster_id, &content).await {
+            tracing::debug!(cluster_id, "bundle update check skipped, no bundle content");
+            return;
+        }
+
+        let mode = self.cluster_update_mode(state, cluster_id).await;
+
+        self.station
+            .clone()
+            .write_channel(AppChannel::Launcher)
+            .launcher
+            .syncing_bundles = true;
+
+        let synced = match tokio::time::timeout(BUNDLE_SYNC_BUDGET, state.bundles.sync(&content))
+            .await
+        {
+            Ok(Ok(_)) => true,
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    cluster_id,
+                    error = %err,
+                    "bundle catalog sync failed, launching against the cached catalog"
+                );
+                false
+            }
+            Err(_elapsed) => {
+                tracing::debug!(
+                    cluster_id,
+                    "bundle catalog sync exceeded its launch budget"
+                );
+                false
+            }
+        };
+
+        self.station
+            .clone()
+            .write_channel(AppChannel::Launcher)
+            .launcher
+            .syncing_bundles = false;
+
+        // No prompt for bundles the package manager's markers carry them instead
+        if !matches!(mode, PackageUpdateMode::Automatic) {
+            tracing::debug!(cluster_id, "bundle updates left for the user to apply");
+            if synced {
+                self.record_bundle_checks([cluster_id]);
+            }
+            return;
+        }
+
+        let applied = match tokio::time::timeout(
+            BUNDLE_APPLY_BUDGET,
+            oneclient_core::apply_bundle_updates(cluster_id, state.bundles.as_ref(), &content),
+        )
+        .await
+        {
+            Ok(applied) => applied,
+            Err(_elapsed) => {
+                tracing::warn!(
+                    cluster_id,
+                    "bundle updates exceeded their launch budget, launching anyway"
+                );
+                return;
+            }
+        };
+
+        let result = match applied {
+            Ok(result) => result,
+            Err(err) => {
+                tracing::warn!(
+                    cluster_id,
+                    error = %err,
+                    "bundle update failed, launching anyway"
+                );
+                return;
+            }
+        };
+
+        if synced {
+            self.record_bundle_checks([cluster_id]);
+        }
+
+        if result.updates_applied.is_empty()
+            && result.additions_applied.is_empty()
+            && result.removals_applied.is_empty()
+        {
+            return;
+        }
+
+        super::invalidate_cluster_queries().await;
+
+        if let Some(spec) =
+            crate::install::cluster_update_notification(cluster_id, &result, &state.services).await
+        {
+            self.push_notification(spec);
+        }
+    }
+
+    /// The check runs and the cache is written whatever the mode says keeping
+    /// the package manager's "Update available" markers honest
+    ///
+    /// Returns once the launch may proceed nothing is still downloading then
+    /// Never fails the launch every error logs and lets the game start
+    async fn resolve_package_updates_before_launch(
+        &self,
+        state: &Arc<oneclient_core::LauncherState>,
+        cluster_id: ClusterId,
+    ) {
+        let content = state.services.content();
+
+        // Bounded a hanging network would otherwise hold the launch for
+        // reqwest's much longer timeouts
+        let check = match tokio::time::timeout(
+            UPDATE_CHECK_BUDGET,
+            oneclient_core::refresh_browser_package_updates(cluster_id, &content),
+        )
+        .await
+        {
+            Ok(Ok(check)) => check,
+            Ok(Err(err)) => {
+                tracing::warn!(
+                    cluster_id,
+                    error = %err,
+                    "browser package update check failed, launching anyway"
+                );
+                return;
+            }
+            Err(_elapsed) => {
+                tracing::debug!(
+                    cluster_id,
+                    "browser package update check exceeded its launch budget"
+                );
+                return;
+            }
+        };
+
+        let pending = check.pending();
+        let mode = self.cluster_update_mode(state, cluster_id).await;
+
+        match plan_launch_updates(mode, pending) {
+            LaunchUpdatePlan::Nothing => {}
+            LaunchUpdatePlan::Apply(updates) => {
+                self.apply_updates_for_launch(state, &updates).await;
+            }
+            LaunchUpdatePlan::Prompt(updates) => {
+                let Some(group) =
+                    crate::install::package_update_group(cluster_id, &updates, &state.services)
+                        .await
+                else {
+                    return;
+                };
+                self.prompt_package_updates(group).await;
+            }
+        }
+    }
+
+    /// Anything unreadable falls back to the default rather than blocking the
+    /// launch on a settings lookup
+    async fn cluster_update_mode(
+        &self,
+        state: &Arc<oneclient_core::LauncherState>,
+        cluster_id: ClusterId,
+    ) -> PackageUpdateMode {
+        let global = state.settings.read().global_game_settings.clone();
+
+        let Ok(cluster) = state.clusters.get(cluster_id).await else {
+            return PackageUpdateMode::default();
+        };
+
+        state
+            .clusters
+            .resolve_settings(&global, &cluster)
+            .await
+            .ok()
+            .and_then(|profile| profile.browser_update_mode)
+            .unwrap_or_default()
+    }
+
+    /// One grouped progress notification so the pre-launch pause shows something
+    async fn apply_updates_for_launch(
+        &self,
+        state: &Arc<oneclient_core::LauncherState>,
+        updates: &[oneclient_core::BrowserPackageUpdate],
+    ) {
+        let content = state.services.content();
+        let session = oneclient_events::GroupedProgressSession::start(
+            &state.services.events,
+            "Updating packages",
+        );
+        session.expect(
+            oneclient_events::TaskCategory::Packages,
+            updates.len() as u64,
+            updates.len() as u64,
+        );
+
+        let mut applied = 0usize;
+        for update in updates {
+            let child = session.child(
+                update.display_name.clone(),
+                1,
+                oneclient_events::TaskCategory::Packages,
+            );
+            match oneclient_core::apply_browser_package_update(update, Some(&child), &content).await
+            {
+                Ok(_) => applied += 1,
+                // Not a reason to hold the game back the cache row survives
+                // so the next launch offers it again
+                Err(err) => tracing::warn!(
+                    package = %update.display_name,
+                    error = %err,
+                    "automatic package update failed"
+                ),
+            }
+            child.finish();
+        }
+
+        let session_id = session.detach();
+        let spec = (applied > 0).then(|| NotificationSpec {
+            title: "Packages updated".to_string(),
+            body: format!(
+                "{applied} package{} updated before launch",
+                if applied == 1 { "" } else { "s" }
+            ),
+            level: Level::Info,
+            icon: Some(IconType::DownloadCloud02),
+            progress: None,
+            actions: Vec::new(),
+        });
+
+        self.with_engine(|app| {
+            app.notifications
+                .finish_grouped_as_actions(&mut app.inbox, session_id, spec);
+        });
+
+        if applied > 0 {
+            super::invalidate_cluster_queries().await;
+        }
+    }
+
+    async fn resolve_optional_mods_before_launch(
+        &self,
+        state: &Arc<oneclient_core::LauncherState>,
+        cluster_id: ClusterId,
+    ) {
+        let pending = match oneclient_core::pending_optional_mods(
+            cluster_id,
+            state.bundles.as_ref(),
+            &state.services.content(),
+        )
+        .await
+        {
+            Ok(pending) => pending,
+            Err(err) => {
+                tracing::warn!(
+                    cluster_id,
+                    error = %err,
+                    "could not read queued optional mods, launching anyway"
+                );
+                return;
+            }
+        };
+
+        // `pending_optional_mods` already drops everything the player turned
+        // down, so an empty list here means there is nothing left to ask
+        let Some(group) =
+            crate::install::pending_optional_group(cluster_id, &pending, &state.services).await
+        else {
+            return;
+        };
+
+        let (done, wait) = tokio::sync::oneshot::channel();
+        self.with_engine(move |state| {
+            state.notifications.open_optional_mods(vec![group], Some(done));
+            state.center_open = false;
+        });
+
+        let _ = wait.await;
+    }
+
+    async fn prompt_package_updates(&self, group: PackageUpdateGroup) {
+        let (done, wait) = tokio::sync::oneshot::channel();
+
+        self.with_engine(move |state| {
+            state.notifications.open_package_updates(vec![group], Some(done));
+            state.center_open = false;
+        });
+
+        let _ = wait.await;
+    }
+
+    pub fn apply_package_update(&self, update: oneclient_core::BrowserPackageUpdate) {
+        let actions = self.clone();
+        spawn_forever(async move {
+            let Ok(state) = launcher::state() else { return };
+            let events = state.services.events.clone();
+
+            let session = oneclient_events::GroupedProgressSession::start(
+                &events,
+                format!("Updating {}", update.display_name),
+            );
+            let child = session.child(
+                update.display_name.clone(),
+                1,
+                oneclient_events::TaskCategory::Packages,
+            );
+
+            let result = oneclient_core::apply_browser_package_update(
+                &update,
+                Some(&child),
+                &state.services.content(),
+            )
+            .await;
+
+            child.finish();
+            let session_id = session.detach();
+
+            let spec = match &result {
+                Ok(_) => NotificationSpec {
+                    title: "Updated".to_string(),
+                    body: format!(
+                        "{} is now on {}",
+                        update.display_name, update.latest_version_name
+                    ),
+                    level: Level::Info,
+                    icon: Some(IconType::DownloadCloud02),
+                    progress: None,
+                    actions: Vec::new(),
+                },
+                Err(err) => NotificationSpec {
+                    title: "Update failed".to_string(),
+                    body: err.to_string(),
+                    level: Level::Error,
+                    icon: None,
+                    progress: None,
+                    actions: Vec::new(),
+                },
+            };
+
+            actions.with_engine(|app| {
+                app.notifications
+                    .finish_grouped_as_actions(&mut app.inbox, session_id, Some(spec));
+            });
+
+            // A failed update stays in the list so the user can retry
+            if result.is_ok() {
+                actions.with_engine(|app| {
+                    app.notifications
+                        .resolve_package_update(update.cluster_id, &update.hash);
+                });
+                super::invalidate_cluster_queries().await;
+            }
+        });
+    }
+
+    /// The package stays marked out of date only the modal stops asking and
+    /// only for this version
+    pub fn skip_package_update(&self, cluster_id: ClusterId, hash: impl Into<String>) {
+        let hash = hash.into();
+        let actions = self.clone();
+        spawn_forever(async move {
+            let Ok(state) = launcher::state() else { return };
+            if let Err(err) = oneclient_core::skip_browser_package_update(
+                cluster_id,
+                &hash,
+                &state.services.content(),
+            )
+            .await
+            {
+                tracing::warn!(error = %err, "failed to record a skipped package update");
+            }
+
+            actions.with_engine(|app| {
+                app.notifications.resolve_package_update(cluster_id, &hash);
+            });
+            super::invalidate_cluster_queries().await;
+        });
+    }
+}
+
+fn group_by_cluster(mods: &[(ClusterId, OptionalModRef)]) -> Vec<(ClusterId, Vec<String>)> {
+    let mut grouped: Vec<(ClusterId, Vec<String>)> = Vec::new();
+
+    for (cluster_id, (_bundle_name, package_id)) in mods {
+        match grouped.iter_mut().find(|(id, _)| id == cluster_id) {
+            Some((_, package_ids)) => package_ids.push(package_id.clone()),
+            None => grouped.push((*cluster_id, vec![package_id.clone()])),
+        }
+    }
+
+    grouped
+}
+
+async fn launch(actions: &Actions, cluster_id: ClusterId) {
+    let Ok(state) = launcher::state() else { return };
+    let events = state.services.events.clone();
+
+    events.game_stage(cluster_id, oneclient_events::LaunchStage::Checking);
+
+    let account = match state.auth.default_account_for_launch().await {
+        Ok(account) => account,
+        Err(err) => {
+            events.game_failed(cluster_id, format!("{err:#}"));
+            return;
+        }
+    };
+
+    let Some(account) = account else {
+        events.game_failed(
+            cluster_id,
+            "Add a Minecraft account before launching.".to_string(),
+        );
+        return;
+    };
+
+    crate::microsoft_java::offer_for_pinned_cluster(actions, cluster_id).await;
+
+    // Before the game process never after Minecraft reads its mods once at
+    // startup
+    actions
+        .resolve_bundle_updates_before_launch(&state, cluster_id)
+        .await;
+    actions
+        .resolve_package_updates_before_launch(&state, cluster_id)
+        .await;
+
+    // After the updates so the player never faces two modals at once
+    actions
+        .resolve_optional_mods_before_launch(&state, cluster_id)
+        .await;
+
+    if let Err(err) = oneclient_core::launch_cluster(&state, cluster_id, &account, true).await {
+        // A missing file is the one failure the launcher can fix itself and a
+        // path inside our metadata folder gives the user nothing to act on
+        if err.indicates_missing_files() {
+            repair_and_relaunch(&state, cluster_id, &account, err).await;
+            return;
+        }
+
+        events.game_failed(cluster_id, format!("{err:#}"));
+    }
+}
+
+/// Only ever one retry if the game still will not start after a full rehash and
+/// repair the problem is not missing files
+async fn repair_and_relaunch(
+    state: &std::sync::Arc<oneclient_core::LauncherState>,
+    cluster_id: ClusterId,
+    account: &oneclient_auth::MinecraftAccount,
+    original: oneclient_core::LauncherError,
+) {
+    let events = state.services.events.clone();
+
+    tracing::warn!(
+        cluster_id,
+        "launch failed on a missing file; repairing: {original:#}"
+    );
+    events
+        .notify("Repairing installation")
+        .body("Some game files are missing. Checking and re-downloading them.")
+        .send();
+
+    let report = match oneclient_core::verify_cluster_files(state, cluster_id).await {
+        Ok(report) => report,
+        Err(repair_err) => {
+            tracing::error!(cluster_id, "repair failed: {repair_err:#}");
+            // Lead with the original failure the repair failure explains why
+            // it was not fixed
+            events.game_failed(
+                cluster_id,
+                format!("{original:#} (repair also failed: {repair_err:#})"),
+            );
+            return;
+        }
+    };
+
+    events
+        .notify("Repair complete")
+        .body(report.summary())
+        .send();
+
+    if let Err(err) = oneclient_core::launch_cluster(state, cluster_id, account, true).await {
+        tracing::error!(cluster_id, "launch failed again after repair: {err:#}");
+        events.game_failed(cluster_id, format!("{err:#}"));
+    }
+}
+
+fn notify_import(events: &oneclient_events::EventBus, report: &LocalImportReport, deferred: bool) {
+    let failed = report.failed.len();
+
+    let Some(mut body) = (match report.imported.as_slice() {
+        [] => None,
+        [only] => Some(format!("Added {}", only.file_name)),
+        rows => Some(format!("Added {} files", rows.len())),
+    }) else {
+        let reason = report
+            .failed
+            .first()
+            .map_or_else(|| "Nothing could be read".to_string(), |(_, err)| err.to_string());
+
+        events.notify("Import failed").body(reason).error().send();
+        return;
+    };
+
+    if failed > 0 {
+        body.push_str(&format!(", {failed} could not be read"));
+    }
+
+    if deferred {
+        body.push_str(". Minecraft is running, so it will be there at the next launch");
+    }
+
+    if failed == 0 {
+        events.notify("Imported").body(body).send();
+        return;
+    }
+
+    events.notify("Imported").body(body).error().send();
+}
+
+#[must_use = "the notification is not raised until `.send()` is called"]
+pub struct NotificationBuilder {
+    actions: Actions,
+    spec: NotificationSpec,
+}
+
+impl NotificationBuilder {
+    pub fn body(mut self, body: impl Into<String>) -> Self {
+        self.spec.body = body.into();
+        self
+    }
+
+    pub fn level(mut self, level: Level) -> Self {
+        self.spec.level = level;
+        self
+    }
+
+    pub fn info(self) -> Self {
+        self.level(Level::Info)
+    }
+
+    pub fn error(self) -> Self {
+        self.level(Level::Error)
+    }
+
+    pub fn icon(mut self, icon: IconType) -> Self {
+        self.spec.icon = Some(icon);
+        self
+    }
+
+    pub fn progress(mut self, current: u64, total: u64) -> Self {
+        self.spec.progress = Some((current, total));
+        self
+    }
+
+    pub fn action(mut self, action: NotificationAction) -> Self {
+        self.spec.actions.push(action);
+        self
+    }
+
+    pub fn actions(mut self, actions: impl IntoIterator<Item = NotificationAction>) -> Self {
+        self.spec.actions = actions.into_iter().collect();
+        self
+    }
+
+    pub fn send(self) {
+        self.actions.push_notification(self.spec);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oneclient_common::domain::ProviderId;
+
+    fn update(hash: &str) -> oneclient_core::BrowserPackageUpdate {
+        oneclient_core::BrowserPackageUpdate {
+            cluster_id: 1,
+            hash: hash.into(),
+            provider: ProviderId::Modrinth,
+            project_id: "sodium".into(),
+            installed_version_id: "v1".into(),
+            installed_version_name: "1.0".into(),
+            latest_version_id: "v2".into(),
+            latest_version_name: "2.0".into(),
+            display_name: "Sodium".into(),
+            skipped: false,
+        }
+    }
+
+    #[test]
+    fn skip_mode_launches_without_asking_or_installing() {
+        assert_eq!(
+            plan_launch_updates(PackageUpdateMode::Skip, vec![update("a")]),
+            LaunchUpdatePlan::Nothing,
+        );
+    }
+
+    #[test]
+    fn automatic_mode_installs_without_asking() {
+        assert_eq!(
+            plan_launch_updates(PackageUpdateMode::Automatic, vec![update("a")]),
+            LaunchUpdatePlan::Apply(vec![update("a")]),
+        );
+    }
+
+    #[test]
+    fn prompt_mode_is_the_default_and_asks() {
+        assert_eq!(
+            plan_launch_updates(PackageUpdateMode::default(), vec![update("a")]),
+            LaunchUpdatePlan::Prompt(vec![update("a")]),
+        );
+    }
+
+    #[test]
+    fn a_cluster_that_was_never_checked_is_due() {
+        assert!(BundleCheckLog::default().due(1, Instant::now()));
+    }
+
+    #[test]
+    fn a_relaunch_inside_the_window_reuses_the_last_check() {
+        let mut log = BundleCheckLog::default();
+        let now = Instant::now();
+        log.record(1, now);
+
+        assert!(!log.due(1, now));
+        assert!(!log.due(1, now + BUNDLE_CHECK_INTERVAL / 2));
+    }
+
+    #[test]
+    fn the_window_reopens_once_the_interval_has_passed() {
+        let mut log = BundleCheckLog::default();
+        let now = Instant::now();
+        log.record(1, now);
+
+        assert!(log.due(1, now + BUNDLE_CHECK_INTERVAL));
+        assert!(log.due(1, now + BUNDLE_CHECK_INTERVAL * 2));
+    }
+
+    #[test]
+    fn clusters_are_throttled_independently() {
+        let mut log = BundleCheckLog::default();
+        let now = Instant::now();
+        log.record(1, now);
+
+        assert!(!log.due(1, now));
+        assert!(log.due(2, now));
+    }
+
+    #[test]
+    fn nothing_pending_never_opens_a_modal() {
+        for mode in PackageUpdateMode::ALL.iter().copied() {
+            assert_eq!(
+                plan_launch_updates(mode, Vec::new()),
+                LaunchUpdatePlan::Nothing,
+                "{mode:?} must not hold a launch up over an empty list",
+            );
+        }
+    }
+
+    const JDK_25: &str = r"C:\jdk-25\bin\javaw.exe";
+
+    fn profile(name: &str, java_path: Option<&str>) -> GameSettingsProfile {
+        GameSettingsProfile {
+            name: name.into(),
+            java_path: java_path.map(Into::into),
+            ..GameSettingsProfile::default_global_profile()
+        }
+    }
+
+    fn cluster(id: i64, name: &str, profile_name: Option<&str>) -> Cluster {
+        Cluster {
+            id,
+            name: name.into(),
+            folder_name: name.into(),
+            setting_profile_name: profile_name.map(Into::into),
+            mc_version: "26.2".into(),
+            mc_loader: oneclient_common::domain::GameLoader::default(),
+            mc_loader_version: None,
+            stage: ClusterStage::default(),
+            created_at: None,
+            last_played: None,
+            overall_played: Duration::ZERO,
+            linked_modpack_hash: None,
+        }
+    }
+
+    #[test]
+    fn a_runtime_nobody_pinned_is_free_to_go() {
+        let profiles = vec![profile("26.2 Fabric", None)];
+        let clusters = vec![cluster(1, "26.2 Fabric", Some("26.2 Fabric"))];
+
+        assert!(clusters_pinned_to_java(&profiles, &clusters, JDK_25).is_empty());
+    }
+
+    #[test]
+    fn a_pinned_runtime_is_reported_under_its_cluster_name() {
+        let profiles = vec![profile("26.2 Fabric", Some(JDK_25))];
+        let clusters = vec![cluster(1, "26.2 Fabric", Some("26.2 Fabric"))];
+
+        assert_eq!(
+            clusters_pinned_to_java(&profiles, &clusters, JDK_25),
+            vec!["26.2 Fabric".to_string()],
+        );
+    }
+
+    #[test]
+    fn only_the_runtime_being_removed_counts() {
+        let profiles = vec![
+            profile("21 pinned", Some(r"C:\jdk-21\bin\javaw.exe")),
+            profile("25 pinned", Some(JDK_25)),
+        ];
+        let clusters = vec![
+            cluster(1, "Old pack", Some("21 pinned")),
+            cluster(2, "New pack", Some("25 pinned")),
+        ];
+
+        assert_eq!(
+            clusters_pinned_to_java(&profiles, &clusters, JDK_25),
+            vec!["New pack".to_string()],
+        );
+    }
+
+    #[test]
+    fn every_cluster_holding_the_runtime_is_named() {
+        let profiles = vec![profile("a", Some(JDK_25)), profile("b", Some(JDK_25))];
+        let clusters = vec![cluster(1, "Alpha", Some("a")), cluster(2, "Beta", Some("b"))];
+
+        assert_eq!(
+            clusters_pinned_to_java(&profiles, &clusters, JDK_25),
+            vec!["Alpha".to_string(), "Beta".to_string()],
+        );
+    }
+
+    #[test]
+    fn a_profile_no_cluster_claims_falls_back_to_its_own_name() {
+        let profiles = vec![profile("orphaned", Some(JDK_25))];
+
+        assert_eq!(
+            clusters_pinned_to_java(&profiles, &[], JDK_25),
+            vec!["orphaned".to_string()],
+        );
+    }
+}
