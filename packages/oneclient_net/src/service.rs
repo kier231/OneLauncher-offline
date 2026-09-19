@@ -334,7 +334,7 @@ fn is_version_install_url(url: &reqwest::Url) -> bool {
     match host.as_str() {
         // Minecraft manifests, client jars, libraries, and assets.
         "piston-meta.mojang.com" | "launchermeta.mojang.com" => {
-            path.starts_with("/mc/game/")
+            path.starts_with("/mc/game/") || path.starts_with("/v1/packages/")
         }
         "piston-data.mojang.com" | "launcher.mojang.com" => true,
         "libraries.minecraft.net" | "resources.download.minecraft.net" => true,
@@ -342,6 +342,7 @@ fn is_version_install_url(url: &reqwest::Url) -> bool {
         // OneClient's Minecraft/loader manifests and version catalogue only.
         "meta.polyfrost.org" => [
             "/minecraft/", "/forge/", "/neo/", "/fabric/", "/quilt/", "/ornithe/",
+            "/maven/",
         ]
         .iter()
         .any(|prefix| path.starts_with(prefix)),
@@ -443,11 +444,13 @@ mod tests {
     fn allows_only_version_install_endpoints() {
         for url in [
             "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json",
+            "https://piston-meta.mojang.com/v1/packages/d8492bc61d32a4874c77daa03c0cba9201e9b83b/34.json",
             "https://piston-data.mojang.com/v1/objects/hash/client.jar",
             "https://libraries.minecraft.net/com/mojang/example.jar",
             "https://resources.download.minecraft.net/ab/hash",
             "https://meta.polyfrost.org/minecraft/v0/manifest.json",
             "https://meta.polyfrost.org/fabric/v0/manifest.json",
+            "https://meta.polyfrost.org/maven/net/fabricmc/fabric-loader.jar",
             "https://data-v2.polyfrost.org/oneclient/versions/metadata.json",
             "https://maven.fabricmc.net/net/fabricmc/fabric-loader.jar",
             "https://api.adoptium.net/v3/assets/version/21",
